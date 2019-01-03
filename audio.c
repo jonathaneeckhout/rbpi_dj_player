@@ -1,4 +1,18 @@
+#include <stdbool.h>
 #include <gst/gst.h>
+
+static bool INPUT_PLAY = false;
+static bool INPUT_STOP = false;
+
+typedef enum _FSM {
+    FSM_INIT,
+    FSM_IDLE,
+    FSM_START,
+    FSM_RUNNING,
+    FSM_STOP,
+    FSM_EXIT
+} FSM;
+
 
 /* Structure to contain all our information, so we can pass it to callbacks */
 typedef struct _CustomData {
@@ -12,6 +26,7 @@ typedef struct _CustomData {
     gboolean seek_enabled; /* Is seeking enabled for this media? */
     gboolean seek_done;    /* Have we performed the seek already? */
     gint64 duration;       /* How long does this media last, in nanoseconds */
+    GstBus *bus;
 } CustomData;
 
 /* Handler for the pad-added signal */
@@ -20,17 +35,190 @@ static void pad_added_handler (GstElement *src, GstPad *pad, CustomData *data);
 /* Forward definition of the message processing function */
 static void handle_message (CustomData *data, GstMessage *msg);
 
+static bool init_player(CustomData * data, const char* song_path) {
+
+    /* Create the elements */
+    data->source = gst_element_factory_make ("filesrc", "source");
+    data->decode = gst_element_factory_make ("decodebin", "decoder");
+    data->convert = gst_element_factory_make ("audioconvert", "convert");
+    data->sink = gst_element_factory_make ("autoaudiosink", "sink");
+
+    /* Create the empty pipeline */
+    data->pipeline = gst_pipeline_new ("test-pipeline");
+
+    if (!data->pipeline || !data->source || !data->decode || !data->convert || !data->sink) {
+        g_printerr ("Not all elements could be created.\n");
+        return false;
+    }
+
+    /* Build the pipeline. Note that we are NOT linking the source at this
+   * point. We will do it later. */
+    gst_bin_add_many (GST_BIN (data->pipeline), data->source, data->decode, data->convert , data->sink, NULL);
+    if (!gst_element_link (data->convert, data->sink)) {
+        g_printerr ("End Elements could not be linked.\n");
+        gst_object_unref (data->pipeline);
+        return false;
+    }
+
+    if (!gst_element_link (data->source, data->decode)) {
+        g_printerr ("Begin Elements could not be linked.\n");
+        gst_object_unref (data->pipeline);
+        return false;
+    }
+
+    /* Set the URI to play */
+    g_object_set (data->source, "location", song_path, NULL);
+
+    /* Connect to the pad-added signal */
+    g_signal_connect (data->decode, "pad-added", G_CALLBACK (pad_added_handler), data);
+
+    return true;
+}
+
+static bool start_player(CustomData *data) {
+    GstStateChangeReturn ret;
+
+    ret = gst_element_set_state (data->pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        g_printerr ("Unable to set the pipeline to the playing state.\n");
+        gst_object_unref (data->pipeline);
+        return false;
+    }
+
+    return true;
+}
+
+static bool stop_player(CustomData *data) {
+    GstStateChangeReturn ret;
+
+    ret = gst_element_set_state (data->pipeline, GST_STATE_PAUSED);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        g_printerr ("Unable to set the pipeline to the playing state.\n");
+        gst_object_unref (data->pipeline);
+        return false;
+    }
+
+    return true;
+}
+
+static bool handle_position_player(CustomData *data) {
+    if (data->playing) {
+        gint64 current = -1;
+
+        /* Query the current position of the stream */
+        if (!gst_element_query_position (data->pipeline, GST_FORMAT_TIME, &current)) {
+//            g_printerr ("Could not query current position.\n");
+//            return false;
+        }
+
+        /* If we didn't know it yet, query the stream duration */
+        if (!GST_CLOCK_TIME_IS_VALID (data->duration)) {
+            if (!gst_element_query_duration (data->pipeline, GST_FORMAT_TIME, &data->duration)) {
+//                g_printerr ("Could not query current duration.\n");
+//                return false;
+            }
+        }
+
+        /* Print current position and total duration */
+        g_print ("Position %" GST_TIME_FORMAT " / %" GST_TIME_FORMAT "\r",
+                 GST_TIME_ARGS (current), GST_TIME_ARGS (data->duration));
+
+        /* If seeking is enabled, we have not done it yet, and the time is right, seek */
+        if (data->seek_enabled && !data->seek_done && current > 30 * GST_SECOND) {
+            //TODO: remove
+            INPUT_STOP = true;
+            //            g_print ("\nReached 10s, performing seek...\n");
+            //            gst_element_seek_simple (data.pipeline, GST_FORMAT_TIME,
+            //                                     GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, 120 * GST_SECOND);
+            //            data.seek_done = TRUE;
+        }
+    }
+    return true;
+}
+
+static bool handle_message_player(CustomData *data) {
+    GstMessage *msg = gst_bus_timed_pop_filtered (data->bus, 100 * GST_MSECOND,
+                                                  GST_MESSAGE_STATE_CHANGED | GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_DURATION);
+
+    /* Parse message */
+    if (msg != NULL) {
+        handle_message (data, msg);
+    } else {
+        /* We got no message, this means the timeout expired */
+        if(!handle_position_player(data)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool fsm_player(FSM *fsm_state, CustomData *data) {
+    switch (*fsm_state) {
+    case FSM_INIT:
+        //g_print ("State:[FSM_INIT]\n");
+        *fsm_state = FSM_IDLE;
+
+        //TODO: remove
+        INPUT_PLAY = true;
+        break;
+    case FSM_IDLE:
+        //g_print ("State:[FSM_IDLE]\n");
+        if (INPUT_PLAY == true) {
+            *fsm_state = FSM_START;
+            //TODO: remove
+            INPUT_PLAY = false;
+        }
+        //        if (INPUT_STOP == true) {
+        //            *fsm_state = FSM_EXIT;
+        //        }
+        break;
+    case FSM_START:
+        //g_print ("State:[FSM_START]\n");
+        if (start_player(data)) {
+            data->bus = gst_element_get_bus (data->pipeline);
+            *fsm_state = FSM_RUNNING;
+        } else {
+            *fsm_state = FSM_IDLE;
+        }
+        break;
+    case FSM_RUNNING:
+        //g_print ("State:[FSM_RUNNING]\n");
+        if (INPUT_STOP == true || data->terminate) {
+            *fsm_state = FSM_STOP;
+        }
+
+        handle_message_player(data);
+
+        break;
+    case FSM_STOP:
+        //g_print ("State:[FSM_STOP]\n");
+        *fsm_state = FSM_IDLE;
+
+        stop_player(data);
+
+        break;
+    case FSM_EXIT:
+        //g_print ("State:[FSM_EXIT]\n");
+
+        break;
+    default:
+        break;
+    }
+    return true;
+}
+
 int main(int argc, char *argv[]) {
     CustomData data;
-    GstBus *bus;
-    GstMessage *msg;
-    GstStateChangeReturn ret;
+    //    GstBus *bus;
+    //    GstMessage *msg;
 
     data.playing = FALSE;
     data.terminate = FALSE;
     data.seek_enabled = FALSE;
     data.seek_done = FALSE;
     data.duration = GST_CLOCK_TIME_NONE;
+    data.bus = NULL;
+    FSM fsm_state = FSM_INIT;
 
     const char* song_path = NULL;
 
@@ -43,93 +231,22 @@ int main(int argc, char *argv[]) {
 
     /* Initialize GStreamer */
     gst_init (&argc, &argv);
-
-    /* Create the elements */
-    data.source = gst_element_factory_make ("filesrc", "source");
-    data.decode = gst_element_factory_make ("decodebin", "decoder");
-    data.convert = gst_element_factory_make ("audioconvert", "convert");
-    data.sink = gst_element_factory_make ("autoaudiosink", "sink");
-
-    /* Create the empty pipeline */
-    data.pipeline = gst_pipeline_new ("test-pipeline");
-
-    if (!data.pipeline || !data.source || !data.decode || !data.convert || !data.sink) {
-        g_printerr ("Not all elements could be created.\n");
+    
+    if (!init_player(&data, song_path)) {
+        g_printerr ("Could not init player\n");
         return -1;
     }
 
-    /* Build the pipeline. Note that we are NOT linking the source at this
-   * point. We will do it later. */
-    gst_bin_add_many (GST_BIN (data.pipeline), data.source, data.decode, data.convert , data.sink, NULL);
-    if (!gst_element_link (data.convert, data.sink)) {
-        g_printerr ("End Elements could not be linked.\n");
-        gst_object_unref (data.pipeline);
-        return -1;
-    }
-
-    if (!gst_element_link (data.source, data.decode)) {
-        g_printerr ("Begin Elements could not be linked.\n");
-        gst_object_unref (data.pipeline);
-        return -1;
-    }
-
-    /* Set the URI to play */
-    g_object_set (data.source, "location", song_path, NULL);
-
-    /* Connect to the pad-added signal */
-    g_signal_connect (data.decode, "pad-added", G_CALLBACK (pad_added_handler), &data);
-
-    /* Start playing */
-    ret = gst_element_set_state (data.pipeline, GST_STATE_PLAYING);
-    if (ret == GST_STATE_CHANGE_FAILURE) {
-        g_printerr ("Unable to set the pipeline to the playing state.\n");
-        gst_object_unref (data.pipeline);
-        return -1;
-    }
-
-    /* Listen to the bus */
-    bus = gst_element_get_bus (data.pipeline);
-    do {
-        msg = gst_bus_timed_pop_filtered (bus, 100 * GST_MSECOND,
-                                          GST_MESSAGE_STATE_CHANGED | GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_DURATION);
-
-        /* Parse message */
-        if (msg != NULL) {
-            handle_message (&data, msg);
-        } else {
-            /* We got no message, this means the timeout expired */
-            if (data.playing) {
-                gint64 current = -1;
-
-                /* Query the current position of the stream */
-                if (!gst_element_query_position (data.pipeline, GST_FORMAT_TIME, &current)) {
-                    g_printerr ("Could not query current position.\n");
-                }
-
-                /* If we didn't know it yet, query the stream duration */
-                if (!GST_CLOCK_TIME_IS_VALID (data.duration)) {
-                    if (!gst_element_query_duration (data.pipeline, GST_FORMAT_TIME, &data.duration)) {
-                        g_printerr ("Could not query current duration.\n");
-                    }
-                }
-
-                /* Print current position and total duration */
-                g_print ("Position %" GST_TIME_FORMAT " / %" GST_TIME_FORMAT "\r",
-                         GST_TIME_ARGS (current), GST_TIME_ARGS (data.duration));
-
-                /* If seeking is enabled, we have not done it yet, and the time is right, seek */
-//                if (data.seek_enabled && !data.seek_done && current > 10 * GST_SECOND) {
-//                    g_print ("\nReached 10s, performing seek...\n");
-//                    gst_element_seek_simple (data.pipeline, GST_FORMAT_TIME,
-//                                             GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, 120 * GST_SECOND);
-//                    data.seek_done = TRUE;
-//                }
-            }
+    while(fsm_state != FSM_EXIT) {
+        if (!fsm_player(&fsm_state, &data)) {
+            g_printerr ("fsm error\n");
+            break;
         }
-    } while (!data.terminate);
+
+    }
 
     /* Free resources */
-    gst_object_unref (bus);
+    //    gst_object_unref (bus);
     gst_element_set_state (data.pipeline, GST_STATE_NULL);
     gst_object_unref (data.pipeline);
     return 0;
@@ -174,8 +291,7 @@ static void handle_message (CustomData *data, GstMessage *msg) {
                 if (gst_element_query (data->pipeline, query)) {
                     gst_query_parse_seeking (query, NULL, &data->seek_enabled, &start, &end);
                     if (data->seek_enabled) {
-                        g_print ("Seeking is ENABLED from %" GST_TIME_FORMAT " to %" GST_TIME_FORMAT "\n",
-                                 GST_TIME_ARGS (start), GST_TIME_ARGS (end));
+                        g_print ("Seeking is ENABLED from %" GST_TIME_FORMAT " to %" GST_TIME_FORMAT "\n", GST_TIME_ARGS (start), GST_TIME_ARGS (end));
                     } else {
                         g_print ("Seeking is DISABLED for this stream.\n");
                     }
