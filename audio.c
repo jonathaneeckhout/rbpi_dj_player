@@ -101,6 +101,11 @@ static bool stop_player(CustomData *data) {
     return true;
 }
 
+static bool set_position_player(CustomData *data, unsigned int position) {
+    gst_element_seek_simple (data->pipeline, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, position * GST_SECOND);
+    return true;
+}
+
 static bool handle_position_player(CustomData *data) {
     if (data->playing) {
         gint64 current = -1;
@@ -124,7 +129,7 @@ static bool handle_position_player(CustomData *data) {
                  GST_TIME_ARGS (current), GST_TIME_ARGS (data->duration));
 
         /* If seeking is enabled, we have not done it yet, and the time is right, seek */
-        if (data->seek_enabled && !data->seek_done && current > 30 * GST_SECOND) {
+        if (data->seek_enabled && !data->seek_done && current > 10 * GST_SECOND) {
             //TODO: remove
             INPUT_STOP = true;
             //            g_print ("\nReached 10s, performing seek...\n");
@@ -195,6 +200,9 @@ static bool fsm_player(FSM *fsm_state, CustomData *data) {
         *fsm_state = FSM_IDLE;
 
         stop_player(data);
+        set_position_player(data, 0);
+        INPUT_PLAY = true;
+        INPUT_STOP = false;
 
         break;
     case FSM_EXIT:
