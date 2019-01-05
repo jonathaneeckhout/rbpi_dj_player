@@ -7,10 +7,13 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <sys/time.h>
 
 #define I2C_FILENAME "/dev/i2c-1"
 #define I2C_SLAVE_ADDR 0x08
 #define I2C_SLAVE_PAYLOAD_SIZE 6
+#define LOOP_PERIOD 50 //loop over fsm every 50 ms
 
 static bool INPUT_PLAY = false;
 static bool INPUT_STOP = false;
@@ -275,52 +278,6 @@ static bool fsm_player(FSM *fsm_state, CustomData *data) {
     return true;
 }
 
-int main(int argc, char *argv[]) {
-    CustomData data;
-    //    GstBus *bus;
-    //    GstMessage *msg;
-
-    data.playing = FALSE;
-    data.terminate = FALSE;
-    data.seek_enabled = FALSE;
-    data.seek_done = FALSE;
-    data.duration = GST_CLOCK_TIME_NONE;
-    data.bus = NULL;
-    FSM fsm_state = FSM_INIT;
-
-    const char* song_path = NULL;
-
-    if (argc < 2) {
-        g_printerr ("Not enough input arguments, please use audio_player <your mp3 file>.\n");
-        return -1;
-    }
-
-    song_path = argv[1];
-
-    /* Initialize GStreamer */
-    gst_init (&argc, &argv);
-    
-    if (!init_player(&data, song_path)) {
-        g_printerr ("Could not init player\n");
-        return -1;
-    }
-
-    while(fsm_state != FSM_EXIT) {
-        read_inputs();
-        if (!fsm_player(&fsm_state, &data)) {
-            g_printerr ("fsm error\n");
-            break;
-        }
-
-    }
-
-    /* Free resources */
-    //    gst_object_unref (bus);
-    gst_element_set_state (data.pipeline, GST_STATE_NULL);
-    gst_object_unref (data.pipeline);
-    return 0;
-}
-
 static void handle_message (CustomData *data, GstMessage *msg) {
     GError *err;
     gchar *debug_info;
@@ -420,4 +377,64 @@ exit:
 
     /* Unreference the sink pad */
     gst_object_unref (sink_pad);
+}
+
+static long get_microtime(){
+    struct timeval currentTime;
+    gettimeofday(&currentTime, NULL);
+    return currentTime.tv_sec * (int)1e6 + currentTime.tv_usec;
+}
+
+int main(int argc, char *argv[]) {
+    CustomData data;
+    //    GstBus *bus;
+    //    GstMessage *msg;
+
+    data.playing = FALSE;
+    data.terminate = FALSE;
+    data.seek_enabled = FALSE;
+    data.seek_done = FALSE;
+    data.duration = GST_CLOCK_TIME_NONE;
+    data.bus = NULL;
+    FSM fsm_state = FSM_INIT;
+
+    const char* song_path = NULL;
+
+    long time_now;
+    long time_previous;
+
+    if (argc < 2) {
+        g_printerr ("Not enough input arguments, please use audio_player <your mp3 file>.\n");
+        return -1;
+    }
+
+    song_path = argv[1];
+
+    /* Initialize GStreamer */
+    gst_init (&argc, &argv);
+
+    if (!init_player(&data, song_path)) {
+        g_printerr ("Could not init player\n");
+        return -1;
+    }
+
+    time_previous = get_microtime();
+
+    while(fsm_state != FSM_EXIT) {
+        time_now = get_microtime();
+        if((time_now - time_previous) > LOOP_PERIOD) {
+            read_inputs();
+            if (!fsm_player(&fsm_state, &data)) {
+                g_printerr ("fsm error\n");
+                break;
+            }
+            time_previous = time_now;
+        }
+    }
+
+    /* Free resources */
+    //    gst_object_unref (bus);
+    gst_element_set_state (data.pipeline, GST_STATE_NULL);
+    gst_object_unref (data.pipeline);
+    return 0;
 }
