@@ -14,9 +14,13 @@
 #define I2C_SLAVE_ADDR 0x08
 #define I2C_SLAVE_PAYLOAD_SIZE 6
 #define LOOP_PERIOD 1000 //loop over fsm every 1 ms
+#define LOOP_SPEEDUP_PERIOD 100000
 
-static bool INPUT_PLAY = false;
-static bool INPUT_STOP = false;
+static volatile bool INPUT_PLAY = false;
+static volatile bool INPUT_STOP = false;
+
+static volatile unsigned int INPUT_ANALOG_X = 0;
+static volatile unsigned int INPUT_ANALOG_Y = 0;
 
 typedef enum _FSM {
     FSM_INIT,
@@ -35,6 +39,7 @@ typedef struct _CustomData {
     GstElement *decode;
     GstElement *source;
     GstElement *convert;
+    GstElement *speed;
     GstElement *sink;
     gboolean playing;      /* Are we in the PLAYING state? */
     gboolean terminate;    /* Should we terminate execution? */
@@ -42,6 +47,7 @@ typedef struct _CustomData {
     gboolean seek_done;    /* Have we performed the seek already? */
     gint64 duration;       /* How long does this media last, in nanoseconds */
     GstBus *bus;
+    gdouble rate;
 } CustomData;
 
 /* Handler for the pad-added signal */
@@ -50,7 +56,43 @@ static void pad_added_handler (GstElement *src, GstPad *pad, CustomData *data);
 /* Forward definition of the message processing function */
 static void handle_message (CustomData *data, GstMessage *msg);
 
-static bool read_inputs() {
+static int analog_direction(unsigned int analog_value) {
+    if (analog_value > 150) {
+        return 1;
+    } else if (analog_value < 110) {
+        return -1;
+    } else {
+        return 0;
+    }
+}
+
+//static void send_seek_event (CustomData *data) {
+//  gint64 position;
+//  GstFormat format = GST_FORMAT_TIME;
+//  GstEvent *seek_event;
+
+//  /* Obtain the current position, needed for the seek event */
+//  if (!gst_element_query_position (data->pipeline, format, &position)) {
+//    g_printerr ("Unable to retrieve current position.\n");
+//    return;
+//  }
+
+//  /* Create the seek event */
+//  if (data->rate > 0) {
+//    seek_event = gst_event_new_seek (data->rate, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE,
+//        GST_SEEK_TYPE_SET, position, GST_SEEK_TYPE_NONE, 0);
+//  } else {
+//    seek_event = gst_event_new_seek (data->rate, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE,
+//        GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_SET, position);
+//  }
+
+//  /* Send the event */
+//  gst_element_send_event (data->sink, seek_event);
+
+//  g_print ("Current rate: %g\n", data->rate);
+//}
+
+static bool read_inputs(CustomData *data) {
     bool retval = false;
     int fd = 0;
     unsigned char buf[I2C_SLAVE_PAYLOAD_SIZE];
@@ -79,6 +121,7 @@ static bool read_inputs() {
         goto exit;
     }
     else {
+        /* handle the buttons */
         if (buf[4] == 0x1) {
             INPUT_PLAY = true;
         } else {
@@ -88,6 +131,12 @@ static bool read_inputs() {
             INPUT_STOP = true;
         } else {
             INPUT_STOP = false;
+        }
+        /* handle the analog inputs */
+        int direction = analog_direction(buf[2]);
+        if (direction != 0) {
+            data->rate = data->rate + (data->rate * direction * 0.001);
+//            g_print("rate %f\n", data->rate);
         }
     }
 
@@ -103,20 +152,21 @@ static bool init_player(CustomData * data, const char* song_path) {
     data->source = gst_element_factory_make ("filesrc", "source");
     data->decode = gst_element_factory_make ("decodebin", "decoder");
     data->convert = gst_element_factory_make ("audioconvert", "convert");
+    data->speed = gst_element_factory_make ("speed", "speed");
     data->sink = gst_element_factory_make ("autoaudiosink", "sink");
 
     /* Create the empty pipeline */
     data->pipeline = gst_pipeline_new ("test-pipeline");
 
-    if (!data->pipeline || !data->source || !data->decode || !data->convert || !data->sink) {
+    if (!data->pipeline || !data->source || !data->decode || !data->convert || !data->speed ||!data->sink) {
         g_printerr ("Not all elements could be created.\n");
         return false;
     }
 
     /* Build the pipeline. Note that we are NOT linking the source at this
    * point. We will do it later. */
-    gst_bin_add_many (GST_BIN (data->pipeline), data->source, data->decode, data->convert , data->sink, NULL);
-    if (!gst_element_link (data->convert, data->sink)) {
+    gst_bin_add_many (GST_BIN (data->pipeline), data->source, data->decode, data->convert, data->speed, data->sink, NULL);
+    if (!gst_element_link_many (data->convert, data->speed, data->sink, NULL)) {
         g_printerr ("End Elements could not be linked.\n");
         gst_object_unref (data->pipeline);
         return false;
@@ -130,6 +180,9 @@ static bool init_player(CustomData * data, const char* song_path) {
 
     /* Set the URI to play */
     g_object_set (data->source, "location", song_path, NULL);
+
+    /* Set the URI to play */
+    g_object_set (data->speed, "speed", data->rate, NULL);
 
     /* Connect to the pad-added signal */
     g_signal_connect (data->decode, "pad-added", G_CALLBACK (pad_added_handler), data);
@@ -222,16 +275,14 @@ static bool fsm_player(FSM *fsm_state, CustomData *data) {
     case FSM_INIT:
         //g_print ("State:[FSM_INIT]\n");
         *fsm_state = FSM_IDLE;
-
+        INPUT_PLAY = true;
         break;
     case FSM_IDLE:
         //g_print ("State:[FSM_IDLE]\n");
         if (INPUT_PLAY == true) {
             *fsm_state = FSM_START;
+            INPUT_PLAY = false;
         }
-        //        if (INPUT_STOP == true) {
-        //            *fsm_state = FSM_EXIT;
-        //        }
         break;
     case FSM_START:
         //g_print ("State:[FSM_START]\n");
@@ -387,8 +438,6 @@ static long get_microtime(){
 
 int main(int argc, char *argv[]) {
     CustomData data;
-    //    GstBus *bus;
-    //    GstMessage *msg;
 
     data.playing = FALSE;
     data.terminate = FALSE;
@@ -396,12 +445,14 @@ int main(int argc, char *argv[]) {
     data.seek_done = FALSE;
     data.duration = GST_CLOCK_TIME_NONE;
     data.bus = NULL;
+    data.rate = 1.0;
     FSM fsm_state = FSM_INIT;
 
     const char* song_path = NULL;
 
     long time_now;
     long time_previous;
+    long time_speedup_previous;
 
     if (argc < 2) {
         g_printerr ("Not enough input arguments, please use audio_player <your mp3 file>.\n");
@@ -419,21 +470,26 @@ int main(int argc, char *argv[]) {
     }
 
     time_previous = get_microtime();
+    time_speedup_previous = time_previous;
 
     while(fsm_state != FSM_EXIT) {
         time_now = get_microtime();
-        if((time_now - time_previous) > LOOP_PERIOD) {
-            read_inputs();
+        if ((time_now - time_previous) > LOOP_PERIOD) {
+            read_inputs(&data);
             if (!fsm_player(&fsm_state, &data)) {
                 g_printerr ("fsm error\n");
                 break;
             }
             time_previous = time_now;
         }
+
+        if ((time_now - time_speedup_previous)> LOOP_SPEEDUP_PERIOD) {
+            g_object_set (data.speed, "speed", data.rate, NULL);
+            time_speedup_previous = time_now;
+        }
     }
 
     /* Free resources */
-    //    gst_object_unref (bus);
     gst_element_set_state (data.pipeline, GST_STATE_NULL);
     gst_object_unref (data.pipeline);
     return 0;
