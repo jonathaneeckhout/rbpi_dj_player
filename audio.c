@@ -1,5 +1,16 @@
 #include <stdbool.h>
 #include <gst/gst.h>
+#include <linux/i2c-dev.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define I2C_FILENAME "/dev/i2c-1"
+#define I2C_SLAVE_ADDR 0x08
+#define I2C_SLAVE_PAYLOAD_SIZE 6
 
 static bool INPUT_PLAY = false;
 static bool INPUT_STOP = false;
@@ -9,6 +20,7 @@ typedef enum _FSM {
     FSM_IDLE,
     FSM_START,
     FSM_RUNNING,
+    FSM_PAUZE,
     FSM_STOP,
     FSM_EXIT
 } FSM;
@@ -34,6 +46,53 @@ static void pad_added_handler (GstElement *src, GstPad *pad, CustomData *data);
 
 /* Forward definition of the message processing function */
 static void handle_message (CustomData *data, GstMessage *msg);
+
+static bool read_inputs() {
+    bool retval = false;
+    int fd = 0;
+    unsigned char buf[I2C_SLAVE_PAYLOAD_SIZE];
+
+    memset(buf, 0, I2C_SLAVE_PAYLOAD_SIZE);
+
+    if ((fd = open(I2C_FILENAME, O_RDWR)) < 0) {
+        g_printerr ("Failed to open i2c port.\n");
+        return false;
+    }
+
+    if (ioctl(fd, I2C_SLAVE, I2C_SLAVE_ADDR) < 0) {
+        g_printerr ("Unable to get bus access to talk to slave\n");
+        goto exit;
+    }
+
+    buf[0] = 0;     // This is the register we want to read from
+
+    if ((write(fd, buf, 1)) != 1) {     // Send register we want to read from
+        g_printerr ("Error writing to i2c slave\n");
+        goto exit;
+    }
+
+    if (read(fd, buf, I2C_SLAVE_PAYLOAD_SIZE) != I2C_SLAVE_PAYLOAD_SIZE) {    // Read back data into buf[]
+        g_printerr ("Unable to read  header from slave\n");
+        goto exit;
+    }
+    else {
+        if (buf[4] == 0x1) {
+            INPUT_PLAY = true;
+        } else {
+            INPUT_PLAY = false;
+        }
+        if (buf[5] == 0x1) {
+            INPUT_STOP = true;
+        } else {
+            INPUT_STOP = false;
+        }
+    }
+
+    retval = true;
+exit:
+    close(fd);
+    return retval;
+}
 
 static bool init_player(CustomData * data, const char* song_path) {
 
@@ -112,15 +171,15 @@ static bool handle_position_player(CustomData *data) {
 
         /* Query the current position of the stream */
         if (!gst_element_query_position (data->pipeline, GST_FORMAT_TIME, &current)) {
-//            g_printerr ("Could not query current position.\n");
-//            return false;
+            //            g_printerr ("Could not query current position.\n");
+            //            return false;
         }
 
         /* If we didn't know it yet, query the stream duration */
         if (!GST_CLOCK_TIME_IS_VALID (data->duration)) {
             if (!gst_element_query_duration (data->pipeline, GST_FORMAT_TIME, &data->duration)) {
-//                g_printerr ("Could not query current duration.\n");
-//                return false;
+                //                g_printerr ("Could not query current duration.\n");
+                //                return false;
             }
         }
 
@@ -129,14 +188,12 @@ static bool handle_position_player(CustomData *data) {
                  GST_TIME_ARGS (current), GST_TIME_ARGS (data->duration));
 
         /* If seeking is enabled, we have not done it yet, and the time is right, seek */
-        if (data->seek_enabled && !data->seek_done && current > 10 * GST_SECOND) {
-            //TODO: remove
-            INPUT_STOP = true;
-            //            g_print ("\nReached 10s, performing seek...\n");
-            //            gst_element_seek_simple (data.pipeline, GST_FORMAT_TIME,
-            //                                     GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, 120 * GST_SECOND);
-            //            data.seek_done = TRUE;
-        }
+        //if (data->seek_enabled && !data->seek_done && current > 10 * GST_SECOND) {
+        //            g_print ("\nReached 10s, performing seek...\n");
+        //            gst_element_seek_simple (data.pipeline, GST_FORMAT_TIME,
+        //                                     GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, 120 * GST_SECOND);
+        //            data.seek_done = TRUE;
+        //}
     }
     return true;
 }
@@ -163,15 +220,11 @@ static bool fsm_player(FSM *fsm_state, CustomData *data) {
         //g_print ("State:[FSM_INIT]\n");
         *fsm_state = FSM_IDLE;
 
-        //TODO: remove
-        INPUT_PLAY = true;
         break;
     case FSM_IDLE:
         //g_print ("State:[FSM_IDLE]\n");
         if (INPUT_PLAY == true) {
             *fsm_state = FSM_START;
-            //TODO: remove
-            INPUT_PLAY = false;
         }
         //        if (INPUT_STOP == true) {
         //            *fsm_state = FSM_EXIT;
@@ -190,6 +243,8 @@ static bool fsm_player(FSM *fsm_state, CustomData *data) {
         //g_print ("State:[FSM_RUNNING]\n");
         if (INPUT_STOP == true || data->terminate) {
             *fsm_state = FSM_STOP;
+        } else if (INPUT_PLAY == true) {
+            *fsm_state = FSM_PAUZE;
         }
 
         handle_message_player(data);
@@ -201,8 +256,13 @@ static bool fsm_player(FSM *fsm_state, CustomData *data) {
 
         stop_player(data);
         set_position_player(data, 0);
-        INPUT_PLAY = true;
-        INPUT_STOP = false;
+
+        break;
+    case FSM_PAUZE:
+        //g_print ("State:[FSM_PAUZE]\n");
+        *fsm_state = FSM_IDLE;
+
+        stop_player(data);
 
         break;
     case FSM_EXIT:
@@ -246,6 +306,7 @@ int main(int argc, char *argv[]) {
     }
 
     while(fsm_state != FSM_EXIT) {
+        read_inputs();
         if (!fsm_player(&fsm_state, &data)) {
             g_printerr ("fsm error\n");
             break;
