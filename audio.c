@@ -13,7 +13,7 @@
 #define I2C_FILENAME "/dev/i2c-1"
 #define I2C_SLAVE_ADDR 0x08
 #define I2C_SLAVE_PAYLOAD_SIZE 6
-#define LOOP_PERIOD 50 //loop over fsm every 50 ms
+#define LOOP_PERIOD 1000 //loop over fsm every 1 ms
 
 static bool INPUT_PLAY = false;
 static bool INPUT_STOP = false;
