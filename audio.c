@@ -16,6 +16,9 @@
 #define LOOP_PERIOD 1000 //loop over fsm every 1 ms
 #define LOOP_SPEEDUP_PERIOD 100000
 
+#define RATE_UPPER_LIMIT 1.08
+#define RATE_LOWER_LIMIT 0.92
+
 static volatile bool INPUT_PLAY = false;
 static volatile bool INPUT_STOP = false;
 
@@ -56,6 +59,7 @@ static void pad_added_handler (GstElement *src, GstPad *pad, CustomData *data);
 /* Forward definition of the message processing function */
 static void handle_message (CustomData *data, GstMessage *msg);
 
+
 static int analog_direction(unsigned int analog_value) {
     if (analog_value > 150) {
         return 1;
@@ -65,32 +69,6 @@ static int analog_direction(unsigned int analog_value) {
         return 0;
     }
 }
-
-//static void send_seek_event (CustomData *data) {
-//  gint64 position;
-//  GstFormat format = GST_FORMAT_TIME;
-//  GstEvent *seek_event;
-
-//  /* Obtain the current position, needed for the seek event */
-//  if (!gst_element_query_position (data->pipeline, format, &position)) {
-//    g_printerr ("Unable to retrieve current position.\n");
-//    return;
-//  }
-
-//  /* Create the seek event */
-//  if (data->rate > 0) {
-//    seek_event = gst_event_new_seek (data->rate, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE,
-//        GST_SEEK_TYPE_SET, position, GST_SEEK_TYPE_NONE, 0);
-//  } else {
-//    seek_event = gst_event_new_seek (data->rate, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE,
-//        GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_SET, position);
-//  }
-
-//  /* Send the event */
-//  gst_element_send_event (data->sink, seek_event);
-
-//  g_print ("Current rate: %g\n", data->rate);
-//}
 
 static bool read_inputs(CustomData *data) {
     bool retval = false;
@@ -133,10 +111,17 @@ static bool read_inputs(CustomData *data) {
             INPUT_STOP = false;
         }
         /* handle the analog inputs */
+
+        //Handle speed control
         int direction = analog_direction(buf[2]);
         if (direction != 0) {
-            data->rate = data->rate + (data->rate * direction * 0.001);
-//            g_print("rate %f\n", data->rate);
+            data->rate = data->rate + (direction * 0.001);
+            //Limit range between +8+ and -8%
+            if (data->rate >= RATE_UPPER_LIMIT) {
+                data->rate = RATE_UPPER_LIMIT;
+            } else if (data->rate <= RATE_LOWER_LIMIT) {
+                data->rate = RATE_LOWER_LIMIT;
+            }
         }
     }
 
@@ -240,16 +225,8 @@ static bool handle_position_player(CustomData *data) {
         }
 
         /* Print current position and total duration */
-        g_print ("Position %" GST_TIME_FORMAT " / %" GST_TIME_FORMAT "\r",
-                 GST_TIME_ARGS (current), GST_TIME_ARGS (data->duration));
+        g_print ("Position %" GST_TIME_FORMAT " / %" GST_TIME_FORMAT " rate: %f\r", GST_TIME_ARGS (current), GST_TIME_ARGS (data->duration), data->rate);
 
-        /* If seeking is enabled, we have not done it yet, and the time is right, seek */
-        //if (data->seek_enabled && !data->seek_done && current > 10 * GST_SECOND) {
-        //            g_print ("\nReached 10s, performing seek...\n");
-        //            gst_element_seek_simple (data.pipeline, GST_FORMAT_TIME,
-        //                                     GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, 120 * GST_SECOND);
-        //            data.seek_done = TRUE;
-        //}
     }
     return true;
 }
@@ -447,6 +424,7 @@ int main(int argc, char *argv[]) {
     data.bus = NULL;
     data.rate = 1.0;
     FSM fsm_state = FSM_INIT;
+    gdouble old_rate = 1.0;
 
     const char* song_path = NULL;
 
@@ -484,7 +462,10 @@ int main(int argc, char *argv[]) {
         }
 
         if ((time_now - time_speedup_previous)> LOOP_SPEEDUP_PERIOD) {
-            g_object_set (data.speed, "speed", data.rate, NULL);
+            if(data.rate != old_rate) {
+                g_object_set (data.speed, "speed", data.rate, NULL);
+                old_rate = data.rate;
+            }
             time_speedup_previous = time_now;
         }
     }
