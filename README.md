@@ -34,6 +34,11 @@ Execute the following command
 ./audio_player <YOUR AUDIO FILE>
 ```
 
+* Press the play button to play/pause
+* Press the stop button to stop the song. The playback position will be returned to the beginning.
+* Move the joystick/slider to speed/slow down the song. Currently a max of +-8% speed in/decrease is allowed.
+* Press ctrl+c to stop the programm
+
 ## Acknowledgments
 
 * Thanks to arduino examples
